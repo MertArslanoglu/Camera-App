@@ -2,7 +2,11 @@ import Foundation
 import AVFoundation
 import Combine
 import CoreImage
+#if os(iOS)
 import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
 import Network
 
 class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -25,8 +29,8 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
     // Camera device for zoom control
     private var currentDevice: AVCaptureDevice?
     @Published var zoomFactor: CGFloat = 1.0
-    @Published var maxZoomFactor: CGFloat = 1.0
-    @Published var minZoomFactor: CGFloat = 0.5
+    @Published var maxZoomFactor: CGFloat = 10.0
+    @Published var minZoomFactor: CGFloat = 1.0
     
     // Manual focus control
     @Published var focusDistance: Float = 0.0
@@ -36,8 +40,24 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
     @Published var isFlashEnabled: Bool = false
     @Published var isFlashAvailable: Bool = false
     
+    // SAM Detection
+    @Published var isDetectionEnabled: Bool = true // Enable detection by default for testing
+    @Published var currentImageSize: CGSize = CGSize(width: 640, height: 480)
+    private var samDetector: SAMDetector?
+    
+    // Core Image context for image processing
+    private let ciContext: CIContext
+    
     override init() {
+        // Initialize CIContext with CPU-based rendering for simulator compatibility
+        #if targetEnvironment(simulator)
+        ciContext = CIContext(options: [.useSoftwareRenderer: true])
+        #else
+        ciContext = CIContext()
+        #endif
+        
         super.init()
+        samDetector = SAMDetector()
         setupServer()
     }
     
@@ -67,7 +87,10 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
             let session = AVCaptureSession()
             session.sessionPreset = .high
             
-            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { 
+                print("🔥 CameraService: No camera device available")
+                return
+            }
             
             // Store device reference for zoom control
             self.currentDevice = device
@@ -78,7 +101,7 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
                     session.addInput(input)
                 }
             } catch {
-                print(error)
+                print("🔥 CameraService: Error creating camera input: \(error)")
                 return
             }
             
@@ -90,16 +113,29 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
             
             DispatchQueue.main.async {
                 self.session = session
-                // Set zoom limits
+                #if os(iOS)
+                // Set zoom limits based on actual device capabilities (iOS only)
                 self.maxZoomFactor = min(device.activeFormat.videoMaxZoomFactor, 10.0) // Cap at 10x
-                self.minZoomFactor = 0.5 // Allow zoom out to 0.5x (fixed minimum)
-                self.zoomFactor = device.videoZoomFactor
+                self.minZoomFactor = max(0.5, device.minAvailableVideoZoomFactor) // Support wide-angle if available
+                self.zoomFactor = max(self.minZoomFactor, device.videoZoomFactor) // Ensure we start at valid zoom level
                 
-                // Set initial focus values
+                print("🔥 Device max zoom: \(device.activeFormat.videoMaxZoomFactor)")
+                print("🔥 App zoom range: \(self.minZoomFactor) - \(self.maxZoomFactor)")
+                
+                // Set initial focus values (iOS only)
                 self.isManualFocusEnabled = device.isFocusModeSupported(.locked)
                 if device.focusMode == .locked {
                     self.focusDistance = device.lensPosition
                 }
+                #else
+                // macOS doesn't support zoom or manual focus controls
+                self.maxZoomFactor = 1.0
+                self.minZoomFactor = 1.0
+                self.zoomFactor = 1.0
+                self.isManualFocusEnabled = false
+                self.focusDistance = 0.0
+                print("macOS: Camera controls not available")
+                #endif
                 
                 // Set flash availability
                 self.isFlashAvailable = device.hasTorch && device.isTorchModeSupported(.on)
@@ -107,15 +143,36 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
         }
     }
     
+    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
         let ciImage = CIImage(cvPixelBuffer: imageBuffer)
-        let context = CIContext()
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return }
         
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+        
+        // Update image size for detection overlay
+        DispatchQueue.main.async {
+            self.currentImageSize = CGSize(width: cgImage.width, height: cgImage.height)
+        }
+        
+        // Run SAM detection if enabled
+        if isDetectionEnabled {
+            print("🔥 CameraService: Detection enabled - calling SAM detector")
+            samDetector?.detectObjects(in: cgImage)
+        } else {
+            print("🔥 CameraService: Detection disabled")
+        }
+        
+        #if os(iOS)
         let uiImage = UIImage(cgImage: cgImage)
         guard let jpegData = uiImage.jpegData(compressionQuality: 0.5) else { return }
+        #elseif os(macOS)
+        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        guard let tiffData = nsImage.tiffRepresentation,
+              let bitmapRep = NSBitmapImageRep(data: tiffData),
+              let jpegData = bitmapRep.representation(using: .jpeg, properties: [.compressionFactor: 0.5]) else { return }
+        #endif
         
         frameQueue.async(flags: .barrier) {
             self.currentFrame = jpegData
@@ -123,12 +180,20 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
     }
     
     func setZoom(_ factor: CGFloat) {
+        #if os(iOS)
         guard let device = currentDevice else { return }
+        
+        // Clamp the zoom factor to valid range
+        let clampedFactor = max(minZoomFactor, min(factor, maxZoomFactor))
         
         sessionQueue.async {
             do {
                 try device.lockForConfiguration()
-                device.videoZoomFactor = max(self.minZoomFactor, min(factor, device.activeFormat.videoMaxZoomFactor))
+                
+                // Ensure the zoom factor is within device limits (minimum is always 1.0 for most devices)
+                let safeFactor = max(1.0, min(clampedFactor, device.activeFormat.videoMaxZoomFactor))
+                
+                device.videoZoomFactor = safeFactor
                 device.unlockForConfiguration()
                 
                 DispatchQueue.main.async {
@@ -138,9 +203,14 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
                 print("Error setting zoom: \(error)")
             }
         }
+        #else
+        // macOS doesn't support zoom
+        print("Zoom not supported on macOS")
+        #endif
     }
     
     func setManualFocus(_ distance: Float) {
+        #if os(iOS)
         guard let device = currentDevice, device.isFocusModeSupported(.locked) else { return }
         
         sessionQueue.async {
@@ -157,6 +227,10 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
                 print("Error setting manual focus: \(error)")
             }
         }
+        #else
+        // macOS doesn't support manual focus
+        print("Manual focus not supported on macOS")
+        #endif
     }
     
     func setAutoFocus() {
@@ -178,6 +252,7 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
     }
     
     func enableManualFocus() {
+        #if os(iOS)
         guard let device = currentDevice, device.isFocusModeSupported(.locked) else { return }
         
         sessionQueue.async {
@@ -196,6 +271,10 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
                 print("Error enabling manual focus: \(error)")
             }
         }
+        #else
+        // macOS doesn't support manual focus
+        print("Manual focus not supported on macOS")
+        #endif
     }
     
     func toggleFlash() {
@@ -218,6 +297,23 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
                 print("Error toggling flash: \(error)")
             }
         }
+    }
+    
+    func toggleDetection() {
+        isDetectionEnabled.toggle()
+        print("🔥 CameraService: Detection toggled to \(isDetectionEnabled)")
+        
+        // If we're in simulator mode and detection was just enabled, start mock frame generation
+        #if targetEnvironment(simulator)
+        if isDetectionEnabled {
+            print("🔥 CameraService: Starting mock frame generation for simulator")
+            startMockFrameGeneration()
+        }
+        #endif
+    }
+    
+    func getSAMDetector() -> SAMDetector? {
+        return samDetector
     }
     
     private func setupServer() {
@@ -245,7 +341,7 @@ class CameraService: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
         
         let bindResult = withUnsafePointer(to: &serverAddr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(serverSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                Darwin.bind(serverSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         

@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Combine
 
 struct ContentView: View {
     @StateObject private var cameraService = CameraService()
@@ -14,18 +15,26 @@ struct ContentView: View {
         ZStack {
             Group {
                 if let session = cameraService.session {
-                    CameraView(session: session)
-                        .ignoresSafeArea()
-                        .onAppear {
-                            cameraService.sessionQueue.async {
-                                session.startRunning()
+                    ZStack {
+                        CameraView(session: session)
+                            .ignoresSafeArea()
+                            .onAppear {
+                                cameraService.sessionQueue.async {
+                                    session.startRunning()
+                                }
                             }
-                        }
-                        .onDisappear {
-                            cameraService.sessionQueue.async {
-                                session.stopRunning()
+                            .onDisappear {
+                                cameraService.sessionQueue.async {
+                                    session.stopRunning()
+                                }
                             }
+                        
+                        // SAM Detection Overlay
+                        if cameraService.isDetectionEnabled, let samDetector = cameraService.getSAMDetector() {
+                            SAMDetectionOverlay(samDetector: samDetector, imageSize: cameraService.currentImageSize)
+                                .allowsHitTesting(false)
                         }
+                    }
                 } else {
                     Text("Camera not available")
                 }
@@ -33,10 +42,23 @@ struct ContentView: View {
             
             // Camera Controls Overlay
             VStack {
-                // Flash control button in top area
+                // Top controls (Flash and SAM Detection)
                 HStack {
+                    // SAM Detection toggle
+                    Button(action: {
+                        cameraService.toggleDetection()
+                    }) {
+                        Image(systemName: cameraService.isDetectionEnabled ? "eye.fill" : "eye.slash.fill")
+                            .font(.title2)
+                            .foregroundColor(cameraService.isDetectionEnabled ? .green : .white)
+                            .padding(12)
+                            .background(Color.black.opacity(0.7))
+                            .clipShape(Circle())
+                    }
+                    
                     Spacer()
                     
+                    // Flash control button
                     if cameraService.isFlashAvailable {
                         Button(action: {
                             cameraService.toggleFlash()
@@ -56,6 +78,10 @@ struct ContentView: View {
                 Spacer()
                 
                 VStack(spacing: 15) {
+                    // Detection Status (if enabled)
+                    if cameraService.isDetectionEnabled, let samDetector = cameraService.getSAMDetector() {
+                        SAMStatusView(samDetector: samDetector)
+                    }
                     // Zoom Control
                     VStack(spacing: 10) {
                         Text("Zoom: \(String(format: "%.1fx", cameraService.zoomFactor))")
@@ -160,6 +186,51 @@ struct ContentView: View {
         .onAppear {
             cameraService.checkForPermissions()
         }
+    }
+}
+
+// Wrapper view to properly observe SAM detector changes
+struct SAMDetectionOverlay: View {
+    @ObservedObject var samDetector: SAMDetector
+    let imageSize: CGSize
+    
+    var body: some View {
+        DetectionOverlayView(
+            detectedObjects: samDetector.detectedObjects,
+            imageSize: imageSize
+        )
+    }
+}
+
+// Status view for SAM detection
+struct SAMStatusView: View {
+    @ObservedObject var samDetector: SAMDetector
+    
+    var body: some View {
+        HStack {
+            Circle()
+                .fill(samDetector.isProcessing ? Color.orange : Color.green)
+                .frame(width: 8, height: 8)
+            
+            Text(samDetector.isProcessing ? "Processing..." : "Detecting Objects")
+                .font(.caption)
+                .foregroundColor(.white)
+            
+            Spacer()
+            
+            Text("\(samDetector.detectedObjects.count) objects")
+                .font(.caption)
+                .foregroundColor(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.black.opacity(0.7))
+                .cornerRadius(6)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(0.6))
+        .cornerRadius(12)
+        .padding(.horizontal, 20)
     }
 }
 
